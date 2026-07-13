@@ -1,0 +1,185 @@
+name: backend-ci-cd
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "apps/backend/**"
+      - ".github/workflows/backend-ci-cd.yml"
+  push:
+    branches: [main]
+    paths:
+      - "apps/backend/**"
+      - ".github/workflows/backend-ci-cd.yml"
+
+concurrency:
+  group: backend-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  IMAGE_NAME: backend
+  CONTEXT: apps/backend
+
+jobs:
+  # ── Stage 1: compile + unit tests (fail fast, no Docker, no cloud) ──
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Maven verify
+        working-directory: ${{ env.CONTEXT }}
+        # -U forces re-resolution so a partially-cached dependency (e.g. a
+        # download cancelled by cancel-in-progress, leaving a .lastUpdated
+        # marker) is re-fetched instead of reported as a missing package.
+        run: ./mvnw -B -U verify
+
+  # ── Stage 2: image build → Trivy gate → (main only) push to ACR + cosign sign ──
+  image:
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: read
+      id-token: write # only exercised on main (ACR push + cosign keyless, both via OIDC)
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build image (load only, no push)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ env.CONTEXT }}
+          load: true
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:candidate
+
+      - name: Trivy scan (gate on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:candidate
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          trivyignores: apps/backend/.trivyignore
+
+      - name: Azure login (OIDC, app-ci identity)
+        if: github.event_name == 'push'
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID_APP }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Push immutable sha tag (+ moving :main alias, never used for pinning)
+        if: github.event_name == 'push'
+        run: |
+          az acr login --name "${ACR%%.*}"
+          docker tag "$IMAGE_NAME:candidate" "$ACR/$IMAGE_NAME:sha-${GITHUB_SHA::7}"
+          docker tag "$IMAGE_NAME:candidate" "$ACR/$IMAGE_NAME:main"
+          docker push "$ACR/$IMAGE_NAME:sha-${GITHUB_SHA::7}"
+          docker push "$ACR/$IMAGE_NAME:main"
+        env:
+          ACR: ${{ vars.ACR_LOGIN_SERVER }}
+
+      - name: Install cosign
+        if: github.event_name == 'push'
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: Sign image (cosign keyless — GitHub OIDC, no keys anywhere)
+        if: github.event_name == 'push'
+        run: |
+          # Sign the immutable digest, not the tag: the signature stays valid
+          # even if a tag were ever moved. Kyverno verifies this signature at
+          # admission (gitops/policies/verify-image-signature.yaml).
+          DIGEST=$(az acr repository show \
+            --name "${ACR%%.*}" \
+            --image "$IMAGE_NAME:sha-${GITHUB_SHA::7}" \
+            --query digest -o tsv)
+          cosign sign --yes "$ACR/$IMAGE_NAME@$DIGEST"
+        env:
+          ACR: ${{ vars.ACR_LOGIN_SERVER }}
+
+  # ── Stage 3: GitOps promote to staging (main only) ──
+  # No kubectl/helm from CI anymore: CI's only deploy power is a git commit bumping
+  # the staging image tag; Argo CD in-cluster reconciles it (ADR-0008).
+  promote-staging:
+    runs-on: ubuntu-latest
+    needs: image
+    if: github.event_name == 'push'
+    environment: staging
+    permissions:
+      contents: write # commit the tag bump to gitops/values/
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Bump staging image tag in gitops values
+        run: |
+          TAG="sha-${GITHUB_SHA::7}"
+          FILE="gitops/values/${IMAGE_NAME}-staging.yaml"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          success=0
+          for attempt in 1 2 3 4 5; do
+            git fetch origin main
+            git checkout -B main origin/main
+            yq -i ".image.tag = \"${TAG}\"" "$FILE"
+            if git diff --quiet; then
+              echo "staging already at ${TAG}"
+              success=1
+              break
+            fi
+            git add "$FILE"
+            git commit -m "gitops(${IMAGE_NAME}): staging → ${TAG}"
+            if git push origin main; then
+              success=1
+              break
+            fi
+            echo "push rejected (concurrent promote) — retry ${attempt}"
+            sleep $((attempt * 3))
+          done
+          [ "$success" = "1" ]
+
+  # ── Stage 4: GitOps promote to production (gated by required reviewer) ──
+  promote-production:
+    runs-on: ubuntu-latest
+    needs: promote-staging
+    environment: production
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Bump production image tag in gitops values
+        run: |
+          TAG="sha-${GITHUB_SHA::7}"
+          FILE="gitops/values/${IMAGE_NAME}-production.yaml"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          success=0
+          for attempt in 1 2 3 4 5; do
+            git fetch origin main
+            git checkout -B main origin/main
+            yq -i ".image.tag = \"${TAG}\"" "$FILE"
+            if git diff --quiet; then
+              echo "production already at ${TAG}"
+              success=1
+              break
+            fi
+            git add "$FILE"
+            git commit -m "gitops(${IMAGE_NAME}): production → ${TAG}"
+            if git push origin main; then
+              success=1
+              break
+            fi
+            echo "push rejected (concurrent promote) — retry ${attempt}"
+            sleep $((attempt * 3))
+          done
+          [ "$success" = "1" ]
